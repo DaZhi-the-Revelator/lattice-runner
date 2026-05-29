@@ -1,0 +1,128 @@
+name: Build and Release macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      lattice_ref:
+        description: Lattice tag to build and release (e.g. v0.8.5)
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  LATTICE_REF: ${{ github.event.inputs.lattice_ref }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+          - arch: x86_64
+            runner: macos-15-intel
+      fail-fast: false
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Install Crystal
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: ">=1.20.0"
+
+      - name: Verify Crystal version
+        run: crystal --version
+
+      - name: Checkout lattice
+        run: |
+          git clone --depth=1 --branch "$LATTICE_REF" \
+            "https://codeberg.org/DaZhi-the-Revelator/lattice.git" lattice
+          cd lattice && git submodule update --init --recursive
+
+      - name: Install dependencies
+        working-directory: lattice
+        run: shards install --production
+
+      - name: Install static libs
+        run: brew install libgc pcre2
+
+      - name: Build
+        working-directory: lattice
+        run: |
+          GC_LIB=$(brew ls libgc | grep 'libgc\.a$' | head -1)
+          PCRE_LIB=$(brew ls pcre2 | grep 'libpcre2-8\.a$' | head -1)
+          unset PKG_CONFIG_PATH
+          shards build --production --release --no-debug \
+            --link-flags="$GC_LIB $PCRE_LIB"
+
+      - name: Verify binary
+        working-directory: lattice
+        run: |
+          file bin/lattice
+          bin/lattice --version
+
+      - name: Stage archive
+        working-directory: lattice
+        run: |
+          mkdir -p staging
+          cp bin/lattice staging/
+          cp README.md LICENSE staging/
+          tar -czf ../lattice-macos-${{ matrix.arch }}.tar.gz -C staging .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: macos-${{ matrix.arch }}
+          path: lattice-macos-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  upload-to-codeberg:
+    name: Upload macOS assets to Codeberg release
+    needs: build-macos
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -name '*.tar.gz' \
+            -exec cp {} release-assets/ \;
+          ls -lh release-assets/
+
+      - name: Upload assets to existing Codeberg release
+        env:
+          CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          TAG: ${{ github.event.inputs.lattice_ref }}
+          API: https://codeberg.org/api/v1
+          REPO: DaZhi-the-Revelator/lattice
+        run: |
+          set -e
+
+          RELEASE_ID=$(curl -sf \
+            -H "Authorization: token ${CODEBERG_TOKEN}" \
+            "${API}/repos/${REPO}/releases/tags/${TAG}" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          echo "Release ID: ${RELEASE_ID}"
+
+          for asset in release-assets/*; do
+            name=$(basename "$asset")
+            echo "Uploading ${name}..."
+            curl -sf -X POST \
+              -H "Authorization: token ${CODEBERG_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${asset}" \
+              "${API}/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${name}"
+          done
+
+          echo "macOS assets uploaded to release ${TAG}."
