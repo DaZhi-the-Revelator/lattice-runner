@@ -65,7 +65,7 @@ jobs:
       - name: Install Crystal
         uses: crystal-lang/install-crystal@v1
         with:
-          crystal: ">=1.20.0"
+          crystal: latest
 
       - name: Verify Crystal version
         run: crystal --version
@@ -122,7 +122,7 @@ jobs:
       - name: Install Crystal
         uses: crystal-lang/install-crystal@v1
         with:
-          crystal: ">=1.20.0"
+          crystal: latest
 
       - name: Verify Crystal version
         run: crystal --version
