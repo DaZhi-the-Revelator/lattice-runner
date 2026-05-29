@@ -1,4 +1,4 @@
-name: Build and Release macOS
+name: Build and Release
 
 on:
   workflow_dispatch:
@@ -16,6 +16,95 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  build-linux:
+    name: Build linux-x86_64
+    runs-on: ubuntu-latest
+    container:
+      image: crystallang/crystal:latest-alpine
+
+    steps:
+      - name: Checkout lattice
+        run: |
+          apk add --no-cache git
+          git clone --depth=1 --branch "$LATTICE_REF" \
+            "https://codeberg.org/DaZhi-the-Revelator/lattice.git" lattice
+          cd lattice && git submodule update --init --recursive
+
+      - name: Install dependencies
+        working-directory: lattice
+        run: shards install --production
+
+      - name: Build
+        working-directory: lattice
+        run: shards build --production --release --static --no-debug
+
+      - name: Verify binary
+        working-directory: lattice
+        run: ./bin/lattice --version
+
+      - name: Stage archive
+        working-directory: lattice
+        run: |
+          mkdir -p staging
+          cp bin/lattice staging/
+          cp README.md LICENSE staging/
+          tar -czf ../lattice-linux-x86_64.tar.gz -C staging .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-x86_64
+          path: lattice-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows-x86_64
+    runs-on: windows-latest
+
+    steps:
+      - name: Install Crystal
+        uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: ">=1.20.0"
+
+      - name: Verify Crystal version
+        run: crystal --version
+
+      - name: Checkout lattice
+        run: |
+          git clone --depth=1 --branch "$env:LATTICE_REF" `
+            "https://codeberg.org/DaZhi-the-Revelator/lattice.git" lattice
+          cd lattice
+          git submodule update --init --recursive
+
+      - name: Install dependencies
+        working-directory: lattice
+        run: shards install --production
+
+      - name: Build
+        working-directory: lattice
+        run: shards build --production --release --no-debug
+
+      - name: Verify binary
+        working-directory: lattice
+        run: .\bin\lattice.exe --version
+
+      - name: Stage archive
+        working-directory: lattice
+        run: |
+          mkdir staging
+          copy bin\lattice.exe staging\
+          copy README.md staging\
+          copy LICENSE staging\
+          Compress-Archive -Path staging\* -DestinationPath ..\lattice-windows-x86_64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-x86_64
+          path: lattice-windows-x86_64.zip
+          if-no-files-found: error
+
   build-macos:
     name: Build macOS (${{ matrix.arch }})
     strategy:
@@ -81,12 +170,17 @@ jobs:
           path: lattice-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
-  upload-to-codeberg:
-    name: Upload macOS assets to Codeberg release
-    needs: build-macos
+  release:
+    name: Create Codeberg Release
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout lattice CHANGELOG
+        run: |
+          git clone --depth=1 --branch "$LATTICE_REF" \
+            "https://codeberg.org/DaZhi-the-Revelator/lattice.git" lattice
+
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
@@ -95,22 +189,47 @@ jobs:
       - name: Collect release assets
         run: |
           mkdir -p release-assets
-          find artifacts -type f -name '*.tar.gz' \
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
             -exec cp {} release-assets/ \;
           ls -lh release-assets/
 
-      - name: Upload assets to existing Codeberg release
+      - name: Extract changelog body
+        id: changelog
+        run: |
+          TAG="${{ github.event.inputs.lattice_ref }}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          python3 - "${TAG}" <<'PYEOF' > body.txt
+          import sys, re, pathlib
+
+          tag = sys.argv[1]
+          text = pathlib.Path("lattice/CHANGELOG.md").read_text(encoding="utf-8")
+
+          pattern = rf"(?m)^## \[{re.escape(tag)}\].*?\n(.*?)(?=^## \[|\Z)"
+          m = re.search(pattern, text, re.DOTALL)
+
+          print(m.group(1).strip() if m else "")
+          PYEOF
+
+          echo "Body extracted: $(wc -c < body.txt) bytes"
+
+      - name: Create Codeberg release and upload assets
         env:
           CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-          TAG: ${{ github.event.inputs.lattice_ref }}
+          TAG: ${{ steps.changelog.outputs.tag }}
           API: https://codeberg.org/api/v1
           REPO: DaZhi-the-Revelator/lattice
         run: |
           set -e
 
-          RELEASE_ID=$(curl -sf \
+          RELEASE_ID=$(curl -sf -X POST \
             -H "Authorization: token ${CODEBERG_TOKEN}" \
-            "${API}/repos/${REPO}/releases/tags/${TAG}" \
+            -H "Content-Type: application/json" \
+            --data-binary "$(jq -n \
+              --arg tag "${TAG}" \
+              --rawfile body body.txt \
+              '{tag_name:$tag,name:$tag,body:$body,draft:false,prerelease:false}')" \
+            "${API}/repos/${REPO}/releases" \
             | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
 
           echo "Release ID: ${RELEASE_ID}"
@@ -125,4 +244,4 @@ jobs:
               "${API}/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${name}"
           done
 
-          echo "macOS assets uploaded to release ${TAG}."
+          echo "Release ${TAG} published to Codeberg."
